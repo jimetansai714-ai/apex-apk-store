@@ -1,0 +1,6 @@
+{
+  "name": "ApexAPK - Android APK Market",
+  "description": "Discover, download, and publish verified Android APKs with modern Google Play inspired UI/UX.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,64 @@
+{
+  "entities": {
+    "APKApp": {
+      "title": "APKApp",
+      "description": "Android Package Application metadata stored in catalog",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string", "maxLength": 100 },
+        "nameMy": { "type": "string", "maxLength": 150 },
+        "packageName": { "type": "string", "maxLength": 150 },
+        "developer": { "type": "string", "maxLength": 100 },
+        "category": { "type": "string", "maxLength": 50 },
+        "categoryName": { "type": "string", "maxLength": 100 },
+        "rating": { "type": "number" },
+        "ratingsCount": { "type": "number" },
+        "downloads": { "type": "string", "maxLength": 50 },
+        "downloadCount": { "type": "number" },
+        "size": { "type": "string", "maxLength": 50 },
+        "version": { "type": "string", "maxLength": 50 },
+        "minAndroid": { "type": "string", "maxLength": 50 },
+        "sha256": { "type": "string", "maxLength": 128 },
+        "shortDescription": { "type": "string", "maxLength": 300 },
+        "shortDescriptionMy": { "type": "string", "maxLength": 300 },
+        "description": { "type": "string", "maxLength": 2000 },
+        "changelog": { "type": "string", "maxLength": 1000 },
+        "iconBg": { "type": "string", "maxLength": 100 },
+        "iconSvgType": { "type": "string", "maxLength": 50 },
+        "bannerBg": { "type": "string", "maxLength": 100 },
+        "bannerTagline": { "type": "string", "maxLength": 100 },
+        "downloadUrl": { "type": "string", "maxLength": 1000 },
+        "uploadedAt": { "type": "string", "maxLength": 50 },
+        "isVerified": { "type": "boolean" },
+        "isNew": { "type": "boolean" },
+        "customUploaded": { "type": "boolean" }
+      },
+      "required": ["id", "name", "packageName", "version", "downloadCount", "size", "category"]
+    },
+    "AppReview": {
+      "title": "AppReview",
+      "description": "User review and star rating submitted for an APK application",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "author": { "type": "string", "maxLength": 100 },
+        "rating": { "type": "number" },
+        "date": { "type": "string", "maxLength": 50 },
+        "comment": { "type": "string", "maxLength": 1000 },
+        "helpfulCount": { "type": "number" }
+      },
+      "required": ["id", "author", "rating", "comment"]
+    }
+  },
+  "firestore": {
+    "/apps/{appId}": {
+      "schema": "APKApp",
+      "description": "Collection of all published Android APK items"
+    },
+    "/apps/{appId}/reviews/{reviewId}": {
+      "schema": "AppReview",
+      "description": "Subcollection of user ratings and reviews for an APK"
+    }
+  }
+}

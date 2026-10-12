@@ -1,0 +1,61 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isValidId(id) { 
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); 
+    }
+    
+    function isValidApp(data) {
+      return data.keys().hasAll(['id', 'name', 'packageName', 'version', 'downloadCount', 'size', 'category'])
+        && data.id is string && data.id.size() <= 128
+        && data.name is string && data.name.size() <= 100
+        && data.packageName is string && data.packageName.size() <= 150
+        && data.version is string && data.version.size() <= 50
+        && data.downloadCount is number
+        && data.size is string && data.size.size() <= 50
+        && data.category is string && data.category.size() <= 50;
+    }
+
+    function isValidReview(data) {
+      return data.keys().hasAll(['id', 'author', 'rating', 'comment'])
+        && data.id is string && data.id.size() <= 128
+        && data.author is string && data.author.size() <= 100
+        && data.rating is number && data.rating >= 1 && data.rating <= 5
+        && data.comment is string && data.comment.size() <= 1000;
+    }
+
+    // Apps catalog collection
+    match /apps/{appId} {
+      allow read: if true;
+      allow create, update: if isValidId(appId);
+      allow delete: if isValidId(appId);
+
+      // Reviews subcollection for user ratings and feedback
+      match /reviews/{reviewId} {
+        allow read: if true;
+        allow create, update: if isValidId(appId) && isValidId(reviewId) && isValidReview(request.resource.data);
+        allow delete: if isValidId(appId) && isValidId(reviewId);
+      }
+
+      // Download audit logs subcollection
+      match /download_logs/{logId} {
+        allow read: if true;
+        allow create, update: if isValidId(appId) && isValidId(logId);
+        allow delete: if isValidId(appId) && isValidId(logId);
+      }
+    }
+
+    // Admin & system settings (e.g. GitHub config)
+    match /settings/{settingId} {
+      allow read: if true;
+      allow create, update, delete: if isValidId(settingId);
+    }
+
+    // Default deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
