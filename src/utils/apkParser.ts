@@ -112,10 +112,13 @@ export const parseApkFile = async (file: File): Promise<ParsedApkData> => {
       if (
         (lower.includes('ic_launcher') ||
           lower.includes('app_icon') ||
+          lower.includes('mobile_pos_icon') ||
+          lower.includes('logo_icon') ||
           lower.includes('/icon.png') ||
           lower.includes('/logo.png') ||
           lower.includes('ic_stat') ||
           lower.includes('launcher')) &&
+        !lower.includes('notification') &&
         (lower.endsWith('.png') || lower.endsWith('.webp'))
       ) {
         iconCandidates.push(relativePath);
@@ -131,6 +134,49 @@ export const parseApkFile = async (file: File): Promise<ParsedApkData> => {
       const bScore = priorityOrder.findIndex((p) => bLower.includes(p));
       return (aScore === -1 ? 99 : aScore) - (bScore === -1 ? 99 : bScore);
     });
+
+    // Fallback for R8-obfuscated APKs (e.g., res/o-.png, res/5c.webp, res/Lf.png)
+    if (iconCandidates.length === 0) {
+      const obfuscatedCandidates: { path: string; size: number }[] = [];
+      for (const [rel, zobj] of Object.entries(zip.files)) {
+        const lower = rel.toLowerCase();
+        if (
+          !zobj.dir &&
+          lower.startsWith('res/') &&
+          (lower.endsWith('.png') || lower.endsWith('.webp')) &&
+          !lower.includes('.9.png') &&
+          !lower.includes('notification') &&
+          !lower.includes('abc_') &&
+          !lower.includes('common_google')
+        ) {
+          try {
+            const u8 = await zobj.async('uint8array');
+            if (u8.byteLength >= 3000 && u8.byteLength <= 250000) {
+              if (
+                u8.length > 24 &&
+                u8[0] === 0x89 &&
+                u8[1] === 0x50 &&
+                u8[2] === 0x4e &&
+                u8[3] === 0x47
+              ) {
+                const view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+                const w = view.getUint32(16, false);
+                const h = view.getUint32(20, false);
+                if (w === h && w >= 72 && w <= 512) {
+                  obfuscatedCandidates.push({ path: rel, size: u8.byteLength });
+                }
+              } else if (lower.endsWith('.webp') && u8.byteLength >= 5000 && u8.byteLength <= 100000) {
+                obfuscatedCandidates.push({ path: rel, size: u8.byteLength });
+              }
+            }
+          } catch {}
+        }
+      }
+      obfuscatedCandidates.sort((a, b) => b.size - a.size);
+      if (obfuscatedCandidates.length > 0) {
+        iconCandidates.push(obfuscatedCandidates[0].path);
+      }
+    }
 
     if (iconCandidates.length > 0) {
       const bestIconPath = iconCandidates[0];
@@ -152,7 +198,9 @@ export const parseApkFile = async (file: File): Promise<ParsedApkData> => {
           const compressed = await compressLogo(iconFile);
           iconDataUrl = compressed.dataUrl;
         } catch {
-          iconDataUrl = rawDataUrl;
+          if (rawDataUrl.length < 350000) {
+            iconDataUrl = rawDataUrl;
+          }
         }
 
         iconFileName = bestIconPath.split('/').pop();

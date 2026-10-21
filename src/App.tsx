@@ -22,6 +22,7 @@ import { PlayStoreAppCard, PlayStoreListRow } from './components/PlayStoreAppCar
 import { TopRankedRow } from './components/TopRankedRow';
 import { AppDetailModal } from './components/AppDetailModal';
 import { DownloadManagerModal } from './components/DownloadManagerModal';
+import { TopDownloadNotification } from './components/TopDownloadNotification';
 import { WishlistModal } from './components/WishlistModal';
 import { AppCompareModal } from './components/AppCompareModal';
 import { QrCodeModal } from './components/QrCodeModal';
@@ -34,6 +35,8 @@ import { FloatingSupportButton } from './components/FloatingSupportButton';
 import { FAQSection } from './components/FAQSection';
 import { CookieBanner } from './components/CookieBanner';
 import { AdminStandaloneApp } from './admin';
+import { DeveloperPortal } from './components/DeveloperPortal';
+import { triggerActualApkDownload } from './utils/downloadSimulator';
 import { 
   playClickSound, 
   playDownloadSound, 
@@ -44,7 +47,11 @@ import {
 import { 
   subscribeToAppsCatalog, 
   testFirestoreConnection,
-  purgeAllOldMockAppsFromFirestore
+  purgeAllOldMockAppsFromFirestore,
+  saveAppToFirestore,
+  deleteAppFromFirestore,
+  recordAppDownload,
+  isMockSeedApp
 } from './firebase';
 
 export default function App() {
@@ -70,7 +77,19 @@ export default function App() {
     }
   });
 
-  // Keep isAdminView in sync with browser URL hash / popstate without forcing full page reloads
+  // Universal Developer View detection (Supports /developer, ?developer, #developer, #creator)
+  const [isDeveloperPortalView, setIsDeveloperPortalView] = useState<boolean>(() => {
+    try {
+      const path = window.location.pathname.toLowerCase();
+      const search = window.location.search.toLowerCase();
+      const hash = window.location.hash.toLowerCase();
+      return path.includes('developer') || search.includes('developer') || hash.includes('developer') || hash.includes('creator');
+    } catch {
+      return false;
+    }
+  });
+
+  // Keep isAdminView & isDeveloperPortalView in sync with browser URL hash / popstate without forcing full page reloads
   useEffect(() => {
     const handleUrlRoute = () => {
       try {
@@ -78,8 +97,10 @@ export default function App() {
         const search = window.location.search.toLowerCase();
         const hash = window.location.hash.toLowerCase();
         setIsAdminView(path.includes('admin') || search.includes('admin') || hash.includes('admin'));
+        setIsDeveloperPortalView(path.includes('developer') || search.includes('developer') || hash.includes('developer') || hash.includes('creator'));
       } catch {
         setIsAdminView(false);
+        setIsDeveloperPortalView(false);
       }
     };
     window.addEventListener('hashchange', handleUrlRoute);
@@ -92,6 +113,7 @@ export default function App() {
 
   const handleOpenAdmin = useCallback(() => {
     setIsAdminView(true);
+    setIsDeveloperPortalView(false);
     try {
       window.location.hash = 'admin';
     } catch {}
@@ -106,14 +128,64 @@ export default function App() {
     } catch {}
   }, []);
 
+  const handleOpenDeveloperPortal = useCallback(() => {
+    setIsDeveloperPortalView(true);
+    setIsAdminView(false);
+    try {
+      window.location.hash = 'developer';
+    } catch {}
+  }, []);
+
+  const handleExitDeveloperPortal = useCallback(() => {
+    setIsDeveloperPortalView(false);
+    try {
+      if (window.location.hash.toLowerCase().includes('developer') || window.location.hash.toLowerCase().includes('creator')) {
+        window.history.pushState(null, '', window.location.pathname);
+      }
+    } catch {}
+  }, []);
+
+  // Developer app upload, update, and delete callbacks
+  const handleAppUploadedFromDeveloper = useCallback(async (newApp: APKApp) => {
+    setApps((prev) => {
+      const updated = [newApp, ...prev.filter((a) => a.id !== newApp.id)];
+      try {
+        localStorage.setItem('apexapk_full_catalog', JSON.stringify(updated));
+      } catch {}
+      return updated;
+    });
+    await saveAppToFirestore(newApp);
+  }, []);
+
+  const handleUpdateAppFromDeveloper = useCallback(async (updatedApp: APKApp) => {
+    setApps((prev) => {
+      const updated = prev.map((a) => (a.id === updatedApp.id ? updatedApp : a));
+      try {
+        localStorage.setItem('apexapk_full_catalog', JSON.stringify(updated));
+      } catch {}
+      return updated;
+    });
+    await saveAppToFirestore(updatedApp);
+  }, []);
+
+  const handleDeleteAppFromDeveloper = useCallback(async (appId: string) => {
+    setApps((prev) => {
+      const updated = prev.filter((a) => a.id !== appId);
+      try {
+        localStorage.setItem('apexapk_full_catalog', JSON.stringify(updated));
+      } catch {}
+      return updated;
+    });
+    await deleteAppFromFirestore(appId);
+  }, []);
+
   // Apps state - starts clean without mock data
   const [apps, setApps] = useState<APKApp[]>(() => {
     try {
       const stored = localStorage.getItem('apexapk_full_catalog');
       if (stored) {
         const parsed: APKApp[] = JSON.parse(stored);
-        // Exclude any old mock apps
-        return parsed.filter((a) => a.customUploaded && !a.id.startsWith('app-pyi') && !a.id.startsWith('app-shadow'));
+        return parsed.filter((a) => a && a.id && !isMockSeedApp(a));
       }
     } catch {
       // fallback
@@ -121,20 +193,72 @@ export default function App() {
     return [];
   });
 
-  // Real-time Firestore Sync
+  const [isCatalogLoading, setIsCatalogLoading] = useState<boolean>(() => {
+    try {
+      const stored = localStorage.getItem('apexapk_full_catalog');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        return !Array.isArray(parsed) || parsed.length === 0;
+      }
+    } catch {}
+    return true;
+  });
+
+  // Real-time Firestore Sync with safe local merge
   useEffect(() => {
     testFirestoreConnection();
 
+    const loadingTimer = setTimeout(() => {
+      setIsCatalogLoading(false);
+    }, 2500);
+
     const unsubscribe = subscribeToAppsCatalog((firestoreApps) => {
-      // Only keep real user-uploaded apps
-      const realApps = firestoreApps.filter(
-        (a) => a.customUploaded || (!a.id.startsWith('app-pyi') && !a.id.startsWith('app-shadow') && !a.id.startsWith('app-wave') && !a.id.startsWith('app-hyper') && !a.id.startsWith('app-myan') && !a.id.startsWith('app-pixel') && !a.id.startsWith('app-doc') && !a.id.startsWith('app-sec') && !a.id.startsWith('app-speed'))
-      );
-      setApps(realApps);
-      localStorage.setItem('apexapk_full_catalog', JSON.stringify(realApps));
+      setIsCatalogLoading(false);
+      const realApps = firestoreApps.filter((a) => a && a.id && !isMockSeedApp(a));
+
+      setApps((prev) => {
+        if (realApps.length === 0 && prev.length > 0) {
+          // Do not wipe existing apps on transient empty snapshot; sync them back to Firestore
+          prev.forEach((localApp) => {
+            if (!isMockSeedApp(localApp)) {
+              saveAppToFirestore(localApp);
+            }
+          });
+          return prev;
+        }
+
+        // Merge any newly uploaded local apps that haven't echoed from Firestore yet
+        let deletedSet = new Set<string>();
+        try {
+          const rawDel = localStorage.getItem('apexapk_deleted_ids');
+          if (rawDel) deletedSet = new Set(JSON.parse(rawDel));
+        } catch {}
+
+        const firestoreIds = new Set(realApps.map((a) => a.id));
+        const pendingLocal = prev.filter(
+          (a) => a && a.id && !isMockSeedApp(a) && !deletedSet.has(a.id) && !firestoreIds.has(a.id)
+        );
+
+        if (pendingLocal.length > 0) {
+          pendingLocal.forEach((localApp) => {
+            saveAppToFirestore(localApp);
+          });
+        }
+
+        const merged = [...pendingLocal, ...realApps];
+        try {
+          if (merged.length > 0) {
+            localStorage.setItem('apexapk_full_catalog', JSON.stringify(merged));
+          }
+        } catch {}
+        return merged;
+      });
     });
 
-    return () => unsubscribe();
+    return () => {
+      clearTimeout(loadingTimer);
+      unsubscribe();
+    };
   }, []);
 
   // Listen to cross-tab storage updates
@@ -162,6 +286,7 @@ export default function App() {
   // Modals state
   const [selectedApp, setSelectedApp] = useState<APKApp | null>(null);
   const [downloadingApp, setDownloadingApp] = useState<APKApp | null>(null);
+  const [activeTopNotificationApp, setActiveTopNotificationApp] = useState<APKApp | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [isWishlistOpen, setIsWishlistOpen] = useState(false);
   const [isCompareOpen, setIsCompareOpen] = useState(false);
@@ -320,13 +445,6 @@ export default function App() {
     }
   }, [isDark]);
 
-  // Quick 1-click download trigger
-  const handleQuickDownload = (app: APKApp, e: React.MouseEvent) => {
-    e.stopPropagation();
-    playDownloadSound();
-    setDownloadingApp(app);
-  };
-
   // Immediate local update when download is completed and recorded in Firestore
   const handleDownloadRecorded = (appId: string) => {
     setApps((prevApps) =>
@@ -342,6 +460,26 @@ export default function App() {
         return a;
       })
     );
+  };
+
+  // Quick download trigger: immediately triggers download + top notification dropdown
+  const handleStartDownload = (app: APKApp, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    
+    // 1. Trigger actual browser/phone APK download immediately!
+    triggerActualApkDownload(app);
+
+    // 2. Pop up top notification on phone/desktop immediately!
+    setActiveTopNotificationApp(app);
+
+    // 3. Play sound & record in Firestore
+    playDownloadSound();
+    recordAppDownload(app.id, { version: app.version, source: 'Storefront Direct Download' });
+    handleDownloadRecorded(app.id);
+  };
+
+  const handleQuickDownload = (app: APKApp, e: React.MouseEvent) => {
+    handleStartDownload(app, e);
   };
 
   // Handle nav tab clicks
@@ -416,11 +554,27 @@ export default function App() {
 
   const customUploadedCount = apps.filter((a) => a.customUploaded).length;
 
+  if (isDeveloperPortalView) {
+    return (
+      <DeveloperPortal
+        apps={apps}
+        onAppUploaded={handleAppUploadedFromDeveloper}
+        onUpdateApp={handleUpdateAppFromDeveloper}
+        onDeleteApp={handleDeleteAppFromDeveloper}
+        onExit={handleExitDeveloperPortal}
+        language={language}
+      />
+    );
+  }
+
   if (isAdminView) {
     return (
       <AdminStandaloneApp
         onExit={handleExitAdmin}
         initialApps={apps}
+        onParentAppUploaded={handleAppUploadedFromDeveloper}
+        onParentUpdateApp={handleUpdateAppFromDeveloper}
+        onParentDeleteApp={handleDeleteAppFromDeveloper}
       />
     );
   }
@@ -462,6 +616,7 @@ export default function App() {
           }
         }}
         onOpenAdmin={handleOpenAdmin}
+        onOpenDeveloper={handleOpenDeveloperPortal}
       />
 
       {/* Main Content Area */}
@@ -491,8 +646,17 @@ export default function App() {
           onToggleSound={handleToggleSound}
         />
 
-        {/* Clean Empty State when no apps uploaded yet */}
-        {apps.length === 0 ? (
+        {/* Clean Loading State or Empty State when no apps uploaded yet */}
+        {apps.length === 0 && isCatalogLoading ? (
+          <div className="py-16 text-center space-y-4">
+            <div className="w-12 h-12 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center mx-auto animate-pulse">
+              <div className="w-6 h-6 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin" />
+            </div>
+            <p className="text-xs font-semibold text-slate-500 dark:text-slate-400">
+              {language === 'my' ? 'ဆော့ဖ်ဝဲလ် ကတ်တလောက် ရယူနေပါသည်...' : 'Loading verified applications...'}
+            </p>
+          </div>
+        ) : apps.length === 0 ? (
           <div className="py-20 text-center space-y-6 bg-white dark:bg-slate-900/60 rounded-3xl border border-dashed border-slate-300 dark:border-slate-800 p-8 max-w-xl mx-auto shadow-sm animate-in fade-in">
             <div className="w-16 h-16 rounded-2xl bg-emerald-500/10 text-emerald-500 flex items-center justify-center mx-auto shadow-inner">
               <PackageOpen size={32} />
@@ -772,9 +936,7 @@ export default function App() {
         isOpen={Boolean(selectedApp)}
         onClose={() => setSelectedApp(null)}
         onStartDownload={(app) => {
-          setSelectedApp(null);
-          setDownloadingApp(app);
-          playDownloadSound();
+          handleStartDownload(app);
         }}
         language={language}
         onSelectRelatedApp={handleSelectApp}
@@ -784,6 +946,15 @@ export default function App() {
         onOpenQrCode={handleOpenQr}
         onOpenSecurityCert={handleOpenSecurityCert}
         onOpenCompare={handleOpenCompare}
+      />
+
+      {/* Top Phone Notification Bar on Download */}
+      <TopDownloadNotification
+        app={activeTopNotificationApp}
+        isOpen={Boolean(activeTopNotificationApp)}
+        onClose={() => setActiveTopNotificationApp(null)}
+        language={language}
+        onOpenDownloadCenter={(app) => setDownloadingApp(app)}
       />
 
       {/* Download Center & Simulation Progress Modal */}
@@ -810,8 +981,7 @@ export default function App() {
         onSelectApp={handleSelectApp}
         onStartDownload={(app) => {
           setIsWishlistOpen(false);
-          setDownloadingApp(app);
-          playDownloadSound();
+          handleStartDownload(app);
         }}
         language={language}
       />
@@ -824,8 +994,7 @@ export default function App() {
         allApps={apps}
         onStartDownload={(app) => {
           setIsCompareOpen(false);
-          setDownloadingApp(app);
-          playDownloadSound();
+          handleStartDownload(app);
         }}
         language={language}
       />
@@ -880,6 +1049,7 @@ export default function App() {
         onOpenPolicy={(tab) => setActivePolicyTab(tab)}
         onOpenContact={() => setIsContactOpen(true)}
         onOpenAdmin={handleOpenAdmin}
+        onOpenDeveloper={handleOpenDeveloperPortal}
       />
 
     </div>

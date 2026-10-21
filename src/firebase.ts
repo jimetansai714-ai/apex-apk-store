@@ -103,16 +103,176 @@ export async function testFirestoreConnection(): Promise<boolean> {
   }
 }
 
-// Firestore Realtime Catalog Listener with resilient fallback
+const MOCK_APP_PREFIXES = [
+  'app-pyi',
+  'app-shadow',
+  'app-wave',
+  'app-hyper',
+  'app-myan',
+  'app-pixel',
+  'app-doc',
+  'app-sec',
+  'app-speed',
+];
+
+export function isMockSeedApp(app: Partial<APKApp> | null | undefined): boolean {
+  if (!app || !app.id) return false;
+  return MOCK_APP_PREFIXES.some((prefix) => app.id!.startsWith(prefix));
+}
+
+function getDeletedAppIds(): Set<string> {
+  try {
+    const raw = localStorage.getItem('apexapk_deleted_ids');
+    if (raw) {
+      return new Set(JSON.parse(raw));
+    }
+  } catch {}
+  return new Set();
+}
+
+function markAppDeletedLocally(appId: string) {
+  try {
+    const set = getDeletedAppIds();
+    set.add(appId);
+    localStorage.setItem('apexapk_deleted_ids', JSON.stringify(Array.from(set)));
+  } catch {}
+}
+
+function unmarkAppDeletedLocally(appId: string) {
+  try {
+    const set = getDeletedAppIds();
+    if (set.has(appId)) {
+      set.delete(appId);
+      localStorage.setItem('apexapk_deleted_ids', JSON.stringify(Array.from(set)));
+    }
+  } catch {}
+}
+
+function sanitizeAppForFirestoreSizeLimit(app: APKApp): APKApp {
+  const cleanApp: APKApp = JSON.parse(JSON.stringify({ ...app, customUploaded: true }));
+  let serialized = JSON.stringify(cleanApp);
+
+  // Firestore document limit is 1,048,576 bytes. Keep well below 800KB.
+  if (serialized.length > 780000 && Array.isArray(cleanApp.screenshots)) {
+    cleanApp.screenshots = cleanApp.screenshots.map((s, idx) =>
+      s.startsWith('data:') && s.length > 60000
+        ? `Verified application screenshot #${idx + 1}`
+        : s
+    );
+    serialized = JSON.stringify(cleanApp);
+  }
+
+  if (serialized.length > 780000 && cleanApp.iconUrl && cleanApp.iconUrl.length > 500000) {
+    delete cleanApp.iconUrl;
+  }
+
+  return cleanApp;
+}
+
+async function syncCatalogBackupSummary(apps: APKApp[]) {
+  try {
+    const lightweightApps = apps
+      .filter((a) => !isMockSeedApp(a))
+      .map((a) => {
+        const copy = { ...a, customUploaded: true };
+        if (copy.iconUrl && copy.iconUrl.length > 45000) {
+          delete copy.iconUrl;
+        }
+        if (Array.isArray(copy.screenshots)) {
+          copy.screenshots = copy.screenshots.filter((s) => !s.startsWith('data:'));
+        }
+        return JSON.parse(JSON.stringify(copy));
+      });
+    if (lightweightApps.length > 0) {
+      await setDoc(doc(db, 'settings', 'catalog_backup'), {
+        apps: lightweightApps,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+  } catch {
+    // non-fatal backup sync
+  }
+}
+
+// Firestore Realtime Catalog Listener with dual-path fetch and automatic backup recovery
 export function subscribeToAppsCatalog(
   onUpdate: (apps: APKApp[]) => void,
   onError?: (err: any) => void
 ) {
   const appsCol = collection(db, 'apps');
+  let hasDeliveredNonEmpty = false;
+  let isRecovering = false;
+
+  const deliverApps = (rawList: APKApp[]) => {
+    const deletedIds = getDeletedAppIds();
+    const validList = rawList
+      .filter((a) => a && a.id && !isMockSeedApp(a) && !deletedIds.has(a.id))
+      .map((a) => ({ ...a, customUploaded: true }));
+
+    if (validList.length > 0) {
+      hasDeliveredNonEmpty = true;
+      onUpdate(validList);
+    }
+  };
+
+  // 1. Immediate one-shot getDocs fetch so slow long-polling never leaves the UI blank
+  getDocs(appsCol)
+    .then(async (snap) => {
+      if (!snap.empty) {
+        const list: APKApp[] = [];
+        snap.forEach((d) => list.push(d.data() as APKApp));
+        deliverApps(list);
+      } else if (!isRecovering) {
+        isRecovering = true;
+        try {
+          const backupSnap = await getDoc(doc(db, 'settings', 'catalog_backup'));
+          if (backupSnap.exists()) {
+            const backupData = backupSnap.data();
+            if (Array.isArray(backupData?.apps) && backupData.apps.length > 0) {
+              const deletedIds = getDeletedAppIds();
+              const toRestore = (backupData.apps as APKApp[]).filter(
+                (a) => a && a.id && !isMockSeedApp(a) && !deletedIds.has(a.id)
+              );
+              if (toRestore.length > 0) {
+                deliverApps(toRestore);
+                for (const item of toRestore) {
+                  await setDoc(doc(db, 'apps', item.id), sanitizeAppForFirestoreSizeLimit(item));
+                }
+              }
+            }
+          }
+        } catch {}
+        isRecovering = false;
+      }
+    })
+    .catch(() => {});
+
+  // 2. Real-time onSnapshot listener
   return onSnapshot(
     appsCol,
-    (snapshot) => {
+    async (snapshot) => {
       if (snapshot.empty) {
+        // Ignore empty initial cache snapshots while waiting for server
+        if (snapshot.metadata.fromCache || hasDeliveredNonEmpty) {
+          return;
+        }
+        // Check backup before declaring empty
+        try {
+          const backupSnap = await getDoc(doc(db, 'settings', 'catalog_backup'));
+          if (backupSnap.exists()) {
+            const backupData = backupSnap.data();
+            if (Array.isArray(backupData?.apps) && backupData.apps.length > 0) {
+              const deletedIds = getDeletedAppIds();
+              const restored = (backupData.apps as APKApp[]).filter(
+                (a) => a && a.id && !isMockSeedApp(a) && !deletedIds.has(a.id)
+              );
+              if (restored.length > 0) {
+                deliverApps(restored);
+                return;
+              }
+            }
+          }
+        } catch {}
         onUpdate([]);
         return;
       }
@@ -120,10 +280,9 @@ export function subscribeToAppsCatalog(
       snapshot.forEach((d) => {
         list.push(d.data() as APKApp);
       });
-      onUpdate(list);
+      deliverApps(list);
     },
     (error) => {
-      // If temporary backend unavailability, log notice and do not throw uncaught error
       handleFirestoreError(error, OperationType.GET, 'apps');
       onError?.(error);
     }
@@ -134,8 +293,18 @@ export function subscribeToAppsCatalog(
 export async function saveAppToFirestore(app: APKApp): Promise<void> {
   const path = `apps/${app.id}`;
   try {
-    const cleanApp = JSON.parse(JSON.stringify(app)); // strips any undefined fields for Firestore
+    unmarkAppDeletedLocally(app.id);
+    const cleanApp = sanitizeAppForFirestoreSizeLimit(app);
     await setDoc(doc(db, 'apps', app.id), cleanApp);
+
+    // Update backup summary asynchronously
+    getDocs(collection(db, 'apps'))
+      .then((snap) => {
+        const all: APKApp[] = [];
+        snap.forEach((d) => all.push(d.data() as APKApp));
+        syncCatalogBackupSummary(all);
+      })
+      .catch(() => {});
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, path);
   }
@@ -145,7 +314,17 @@ export async function saveAppToFirestore(app: APKApp): Promise<void> {
 export async function deleteAppFromFirestore(appId: string): Promise<void> {
   const path = `apps/${appId}`;
   try {
+    markAppDeletedLocally(appId);
     await deleteDoc(doc(db, 'apps', appId));
+
+    // Also update backup summary so deleted app isn't auto-restored
+    getDocs(collection(db, 'apps'))
+      .then((snap) => {
+        const all: APKApp[] = [];
+        snap.forEach((d) => all.push(d.data() as APKApp));
+        syncCatalogBackupSummary(all.filter((a) => a.id !== appId));
+      })
+      .catch(() => {});
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
@@ -313,8 +492,7 @@ export async function purgeAllOldMockAppsFromFirestore(): Promise<number> {
     let count = 0;
     for (const d of snapshot.docs) {
       const data = d.data() as APKApp;
-      // If it is one of the initial mock apps (not uploaded by user)
-      if (!data.customUploaded || data.id.startsWith('app-pyi') || data.id.startsWith('app-shadow') || data.id.startsWith('app-wave') || data.id.startsWith('app-hyper') || data.id.startsWith('app-myan') || data.id.startsWith('app-pixel') || data.id.startsWith('app-doc') || data.id.startsWith('app-sec') || data.id.startsWith('app-speed')) {
+      if (isMockSeedApp(data)) {
         await deleteDoc(d.ref);
         count++;
       }
@@ -326,21 +504,9 @@ export async function purgeAllOldMockAppsFromFirestore(): Promise<number> {
   }
 }
 
-// Complete wipe of all apps from Firestore
+// Safe purge of only demo/mock apps (never deletes real uploaded apps)
 export async function purgeEntireCatalogFromFirestore(): Promise<number> {
-  try {
-    const appsCol = collection(db, 'apps');
-    const snapshot = await getDocs(appsCol);
-    let count = 0;
-    for (const d of snapshot.docs) {
-      await deleteDoc(d.ref);
-      count++;
-    }
-    return count;
-  } catch (error) {
-    console.warn('Notice while purging entire catalog from Firestore:', error);
-    return 0;
-  }
+  return purgeAllOldMockAppsFromFirestore();
 }
 
 // GitHub Configuration Persistence in Firestore

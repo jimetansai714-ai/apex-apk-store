@@ -48,8 +48,10 @@ import {
   getStoredGitHubConfig, 
   loadGitHubConfigWithFirestore,
   saveGitHubConfig, 
+  removeGitHubConfig,
   testGitHubConnection, 
   uploadApkToGitHubRelease,
+  DEFAULT_GITHUB_CONFIG,
   GitHubConfig 
 } from '../utils/githubStorage';
 import { getGitHubConfigFromFirestore } from '../firebase';
@@ -72,9 +74,9 @@ import {
 
 interface Props {
   apps: APKApp[];
-  onAppUploaded: (newApp: APKApp) => void;
-  onUpdateApp: (updatedApp: APKApp) => void;
-  onDeleteApp: (appId: string) => void;
+  onAppUploaded: (newApp: APKApp) => Promise<void> | void;
+  onUpdateApp: (updatedApp: APKApp) => Promise<void> | void;
+  onDeleteApp: (appId: string) => Promise<void> | void;
   onClose: () => void;
   onLogout?: () => void;
   language: Language;
@@ -138,7 +140,11 @@ export const AdminPanel: React.FC<Props> = ({
   const handleQuickSaveGitHubToken = async (tokenStr: string) => {
     const trimmed = tokenStr.trim();
     if (!trimmed) return;
-    const updated: GitHubConfig = { ...githubConfig, token: trimmed };
+    const updated: GitHubConfig = { 
+      owner: (githubConfig.owner || '').trim() || DEFAULT_GITHUB_CONFIG.owner,
+      repo: (githubConfig.repo || '').trim() || DEFAULT_GITHUB_CONFIG.repo,
+      token: trimmed 
+    };
     setGithubConfig(updated);
     saveGitHubConfig(updated);
     setGithubStatus({ testing: true, message: language === 'my' ? 'GitHub သို့ ချိတ်ဆက်စစ်ဆေးနေပါသည်...' : 'Testing GitHub connection...' });
@@ -304,6 +310,7 @@ export const AdminPanel: React.FC<Props> = ({
   const [upgradeExtractedVersion, setUpgradeExtractedVersion] = useState<string | null>(null);
   const [upgradeNewIconUrl, setUpgradeNewIconUrl] = useState<string | null>(null);
   const [applyNewIcon, setApplyNewIcon] = useState(false);
+  const [upgradeMismatchNotice, setUpgradeMismatchNotice] = useState<string | null>(null);
   const [suggestedVersions, setSuggestedVersions] = useState<{ patch: string; minor: string; major: string }>({
     patch: 'v1.0.1',
     minor: 'v1.1.0',
@@ -323,11 +330,29 @@ export const AdminPanel: React.FC<Props> = ({
     handleTestGitHub(githubConfig);
   };
 
-  // Instant Purge of all old mock apps from Firebase and local state
+  const handleRemoveGitHub = async () => {
+    const emptyConfig = {
+      owner: DEFAULT_GITHUB_CONFIG.owner,
+      repo: DEFAULT_GITHUB_CONFIG.repo,
+      token: '',
+    };
+    setGithubConfig(emptyConfig);
+    setQuickTokenInput('');
+    await removeGitHubConfig();
+    setGithubStatus({
+      testing: false,
+      success: false,
+      message: language === 'my' 
+        ? '✓ GitHub ချိတ်ဆက်မှုအား ရှင်းလင်းဖျက်သိမ်းပြီးပါပြီ (ဆာဗာ သိုလှောင်ခန်းသို့ အလိုအလျောက် ပြောင်းထားပါသည်)' 
+        : 'GitHub disconnected. Server direct storage will be used.',
+    });
+    setUploadStorageOption('server');
+  };
+
+  // Safe Purge of only old mock seed apps (never deletes real uploaded apps)
   const handlePurgeMockApps = async () => {
     setIsPurging(true);
-    await purgeEntireCatalogFromFirestore();
-    localStorage.removeItem('apexapk_full_catalog');
+    await purgeAllOldMockAppsFromFirestore();
     setIsPurging(false);
     setConfirmPurgeModal(false);
   };
@@ -376,17 +401,35 @@ export const AdminPanel: React.FC<Props> = ({
         if (parsed.iconDataUrl) setCustomLogoUrl(parsed.iconDataUrl);
         setExtractedNotice(`✓ "${parsed.name || quickTitle}" ၏ အချက်အလက်များ အလိုအလျောက် ရယူပြီးပါပြီ!`);
 
-        // Check if an app with this packageName or title is ALREADY in the store catalog!
-        const existingApp = apps.find(
+        // STRICT CHECK: Both App Name AND Package Name must match for an update!
+        const parsedName = (parsed.name || quickTitle).trim().toLowerCase();
+        const parsedPkg = (parsed.packageName || '').trim().toLowerCase();
+
+        const exactExistingApp = apps.find(
           (a) =>
-            (parsed.packageName && a.packageName.toLowerCase() === parsed.packageName.toLowerCase()) ||
-            (parsed.name && a.name.toLowerCase() === parsed.name.toLowerCase()) ||
-            a.name.toLowerCase() === quickTitle.toLowerCase()
+            parsedPkg &&
+            parsedName &&
+            a.packageName.toLowerCase() === parsedPkg &&
+            a.name.toLowerCase() === parsedName
         );
-        if (existingApp) {
-          setMatchedExistingApp(existingApp);
+
+        const partialMismatch = apps.find(
+          (a) =>
+            (parsedPkg && a.packageName.toLowerCase() === parsedPkg && a.name.toLowerCase() !== parsedName) ||
+            (parsedName && a.name.toLowerCase() === parsedName && parsedPkg && a.packageName.toLowerCase() !== parsedPkg)
+        );
+
+        if (exactExistingApp) {
+          setMatchedExistingApp(exactExistingApp);
         } else {
           setMatchedExistingApp(null);
+          if (partialMismatch) {
+            setExtractedNotice(
+              language === 'my'
+                ? `⚠️ သတိပေးချက်: စတိုးတွင်ရှိသော "${partialMismatch.name}" နှင့် App Name သို့မဟုတ် Package Name တစ်ခုတည်းသာ တူနေပါသည်။ Update လုပ်ရန် App Name နှင့် Package Name (၂) ခုလုံး အကုန်တူညီရပါမည်။`
+                : `Notice: Only one of App Name or Package Name matches "${partialMismatch.name}". Both must match exactly to perform an update.`
+            );
+          }
         }
       }
     } catch (err) {
@@ -439,7 +482,10 @@ export const AdminPanel: React.FC<Props> = ({
   // Submit new APK from Admin with GitHub upload
   const handleUploadSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim()) return;
+    if (!name.trim()) {
+      alert(language === 'my' ? 'ဆော့ဖ်ဝဲလ် အမည် (App Name) ထည့်သွင်းပေးပါ။' : 'Please provide an application name.');
+      return;
+    }
 
     const chosenCat = CATEGORIES.find((c) => c.id === category);
 
@@ -453,34 +499,33 @@ export const AdminPanel: React.FC<Props> = ({
 
     // 1. Primary: Automatic GitHub Releases Storage (saves genuine APK binary to GitHub Releases CDN)
     if (selectedFile) {
+      const currentAdminAuth = localStorage.getItem('apexapk_admin_auth') || sessionStorage.getItem('apexapk_admin_auth') || undefined;
+
       // Intelligently resolve effective token from all sources
       let effectiveToken = (githubConfig.token || '').trim();
       if (!effectiveToken && quickTokenInput.trim()) {
         effectiveToken = quickTokenInput.trim();
       }
-      if (!effectiveToken) {
+      if (!effectiveToken && uploadStorageOption !== 'server') {
         const stored = getStoredGitHubConfig();
         if (stored.token) effectiveToken = stored.token.trim();
       }
-      if (!effectiveToken) {
+      if (!effectiveToken && uploadStorageOption !== 'server') {
         try {
           const remote = await getGitHubConfigFromFirestore();
           if (remote?.token) effectiveToken = remote.token.trim();
         } catch {}
       }
 
-      if (effectiveToken && effectiveToken !== githubConfig.token) {
-        const updated = { ...githubConfig, token: effectiveToken };
-        setGithubConfig(updated);
-        saveGitHubConfig(updated);
-      }
-
       const activeGhConfig: GitHubConfig = {
-        ...githubConfig,
+        owner: (githubConfig.owner || '').trim() || DEFAULT_GITHUB_CONFIG.owner,
+        repo: (githubConfig.repo || '').trim() || DEFAULT_GITHUB_CONFIG.repo,
         token: effectiveToken,
       };
 
-      if (effectiveToken) {
+      const shouldUseGitHub = uploadStorageOption === 'github' && Boolean(effectiveToken);
+
+      if (shouldUseGitHub && effectiveToken) {
         setIsUploadingToGitHub(true);
         setUploadStatusText(
           language === 'my'
@@ -493,9 +538,9 @@ export const AdminPanel: React.FC<Props> = ({
             selectedFile,
             {
               id: 'temp',
-              name,
-              packageName,
-              developer,
+              name: name.trim(),
+              packageName: packageName.trim() || `com.app.${name.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
+              developer: developer.trim() || 'Apex Dev Team',
               category,
               categoryName: chosenCat?.labelEn || 'Tools',
               rating: 5,
@@ -503,7 +548,7 @@ export const AdminPanel: React.FC<Props> = ({
               downloads: initialDownloads,
               downloadCount: initialDownloadCount,
               size: fileSize,
-              version,
+              version: version.trim() || 'v1.0.0',
               minAndroid,
               sha256: 'sha',
               shortDescription,
@@ -522,45 +567,86 @@ export const AdminPanel: React.FC<Props> = ({
             (msg) => setUploadStatusText(msg)
           );
 
-          if (uploadRes.success && uploadRes.downloadUrl) {
-            githubDownloadUrl = uploadRes.downloadUrl;
+          if (uploadRes.success) {
+            if (uploadRes.downloadUrl) {
+              githubDownloadUrl = uploadRes.downloadUrl;
+            }
+            if (uploadRes.serverDownloadUrl) {
+              serverDownloadUrl = uploadRes.serverDownloadUrl;
+            }
           } else {
             console.warn('GitHub Upload notice:', uploadRes.error);
-            // If running on server, notify that server mirror will be used as direct fallback
-            if (!window.location.hostname.includes('github.io') && window.location.protocol !== 'file:') {
-              setUploadStatusText(language === 'my' ? 'Server Direct Mirror သို့ တိုက်ရိုက် သိမ်းဆည်းနေပါသည်...' : 'Falling back to server storage...');
+            // Fallback directly to server storage
+            setUploadStatusText(language === 'my' ? 'Server Storage သို့ တိုက်ရိုက် သိမ်းဆည်းနေပါသည်...' : 'Falling back to server storage...');
+            setIsUploadingToServer(true);
+            const sRes = await uploadApkToServer(selectedFile, (pct, status) => {
+              setServerUploadProgress(pct);
+              setUploadStatusText(status);
+            }, currentAdminAuth);
+            if (sRes.success && sRes.downloadUrl) {
+              serverDownloadUrl = sRes.downloadUrl;
             } else {
-              alert(`GitHub Upload: ${uploadRes.error || 'Failed to upload APK'}`);
+              alert(language === 'my' ? `ဆာဗာသို့ တင်ရာတွင် အမှားဖြစ်ပေါ်ပါသည်: ${sRes.error || 'Server error'}` : `Server error: ${sRes.error}`);
               setIsUploadingToGitHub(false);
+              setIsUploadingToServer(false);
               return;
             }
           }
         } catch (ghErr: any) {
           console.warn('GitHub Release notice:', ghErr.message);
-          if (window.location.hostname.includes('github.io') || window.location.protocol === 'file:') {
-            alert(`GitHub Upload Error: ${ghErr.message}`);
+          setIsUploadingToServer(true);
+          const sRes = await uploadApkToServer(selectedFile, (pct, status) => {
+            setServerUploadProgress(pct);
+            setUploadStatusText(status);
+          }, currentAdminAuth);
+          if (sRes.success && sRes.downloadUrl) {
+            serverDownloadUrl = sRes.downloadUrl;
+          } else {
+            alert(`Upload Error: ${ghErr.message}`);
             setIsUploadingToGitHub(false);
+            setIsUploadingToServer(false);
             return;
           }
         } finally {
           setIsUploadingToGitHub(false);
+          setIsUploadingToServer(false);
         }
-      }
-
-      // 2. Also upload to app server storage as fast local mirror (or primary if GitHub had an issue)
-      if (!window.location.hostname.includes('github.io') && window.location.protocol !== 'file:') {
+      } else {
+        // Direct Server Storage (when GitHub is removed or user selected server storage)
         try {
           setIsUploadingToServer(true);
-          setUploadStatusText(language === 'my' ? 'ဆာဗာသို့ Mirror ဖိုင် သိမ်းဆည်းနေပါသည်...' : 'Saving local server mirror...');
+          setUploadStatusText(language === 'my' ? 'ဆာဗာသို့ တိုက်ရိုက် သိမ်းဆည်းနေပါသည်...' : 'Saving to server storage...');
           const sRes = await uploadApkToServer(selectedFile, (pct, status) => {
             setServerUploadProgress(pct);
             setUploadStatusText(status);
-          });
+          }, currentAdminAuth);
           if (sRes.success && sRes.downloadUrl) {
             serverDownloadUrl = sRes.downloadUrl;
+          } else if (directUrl) {
+            console.warn('Direct server upload notice, falling back to provided directUrl:', sRes.error);
+          } else {
+            console.warn('Server upload notice:', sRes.error);
+            alert(
+              language === 'my'
+                ? `ဆာဗာသို့ APK ဖိုင်တင်ရာတွင် အမှားဖြစ်ပေါ်ပါသည်: ${sRes.error || 'Server error'}\n\nအကြံပြုချက်:\n• GitHub Pages သို့မဟုတ် Static Host တွင် အသုံးပြုနေပါက GitHub Tab တွင် GitHub Releases Token ထည့်သွင်းချိတ်ဆက်ပေးပါ (သို့မဟုတ် Direct Download Link ထည့်ပါ)\n• Local ကွန်ပျူတာပေါ်တွင် စမ်းသပ်နေပါက 'npm run dev' (သို့မဟုတ် 'npm start') ဖြင့် Express Server ကို run ထားပေးပါ။`
+                : `Server upload notice: ${sRes.error || 'Server error'}\n\nTip: Connect GitHub Releases token in the GitHub tab, provide a Direct Download URL, or ensure the server is running with 'npm run dev'.`
+            );
+            setIsUploadingToServer(false);
+            return;
           }
         } catch (err: any) {
           console.warn('Server upload notice:', err.message);
+          if (directUrl) {
+            console.warn('Server upload notice, proceeding with directUrl:', err.message);
+          } else {
+            alert(
+              language === 'my'
+                ? `ဆာဗာ ချိတ်ဆက်မှု အမှား: ${err.message}\n\nအကြံပြုချက်: GitHub Tab တွင် GitHub Token ချိတ်ဆက်ထားပေးပါ (သို့မဟုတ် Direct Download URL ထည့်သွင်းပါ)။ Local စမ်းသပ်ရန် 'npm run dev' ဖြင့် run ထားပေးပါ။`
+                : `Server connection error: ${err.message}\n\nPlease connect GitHub token or provide a Direct Download URL.`
+            );
+            setIsUploadingToServer(false);
+            return;
+          }
         } finally {
           setIsUploadingToServer(false);
         }
@@ -622,7 +708,7 @@ export const AdminPanel: React.FC<Props> = ({
       githubReleaseUrl: githubDownloadUrl || (finalDownloadUrl.includes('github.com') ? finalDownloadUrl : undefined),
     };
 
-    onAppUploaded(newApp);
+    await onAppUploaded(newApp);
     setUploadedResult({ app: newApp, githubUrl: githubDownloadUrl || finalDownloadUrl });
     try { sessionStorage.removeItem('apexapk_upload_draft'); } catch {}
     setIsUploadSuccess(true);
@@ -694,6 +780,17 @@ export const AdminPanel: React.FC<Props> = ({
       if (parsed.iconDataUrl) {
         setUpgradeNewIconUrl(parsed.iconDataUrl);
       }
+      if (upgradingApp) {
+        const isPkgMismatch = Boolean(parsed.packageName && upgradingApp.packageName && parsed.packageName.toLowerCase() !== upgradingApp.packageName.toLowerCase());
+        const isNameMismatch = Boolean(parsed.name && upgradingApp.name && parsed.name.toLowerCase() !== upgradingApp.name.toLowerCase());
+        if (isPkgMismatch || isNameMismatch) {
+          setUpgradeStatusText(
+            language === 'my'
+              ? `⚠️ သတိပေးချက်: APK Package Name ("${parsed.packageName || 'Unknown'}") သို့မဟုတ် App Name ("${parsed.name || 'Unknown'}") သည် မူရင်း App ("${upgradingApp.name}", "${upgradingApp.packageName}") နှင့် မတူညီပါ။ Update လုပ်ရန် App Name နှင့် Package Name (၂) ခုလုံး အကုန်တူညီရပါမည်။`
+              : `⚠️ Mismatch: Both App Name ("${upgradingApp.name}") and Package Name ("${upgradingApp.packageName}") must match exactly to perform an update.`
+          );
+        }
+      }
     } catch (err) {
       console.warn('Notice parsing upgrade file:', err);
     }
@@ -711,14 +808,36 @@ export const AdminPanel: React.FC<Props> = ({
     e.preventDefault();
     if (!upgradingApp || !upgradeVersion.trim()) return;
 
+    if (upgradeFile) {
+      try {
+        const parsed = await parseApkFile(upgradeFile);
+        if (parsed) {
+          const isPkgMismatch = Boolean(parsed.packageName && upgradingApp.packageName && parsed.packageName.toLowerCase() !== upgradingApp.packageName.toLowerCase());
+          const isNameMismatch = Boolean(parsed.name && upgradingApp.name && parsed.name.toLowerCase() !== upgradingApp.name.toLowerCase());
+          if (isPkgMismatch || isNameMismatch) {
+            alert(
+              language === 'my'
+                ? `❌ Update မပြုလုပ်နိုင်ပါ: ရွေးချယ်ထားသော APK ၏ App Name သို့မဟုတ် Package Name သည် မူရင်း App ("${upgradingApp.name}", "${upgradingApp.packageName}") နှင့် မကိုက်ညီပါ။ Update ပြုလုပ်ရန် App Name နှင့် Package Name (၂) ခုလုံး အကုန်တူညီရပါမည်။`
+                : `Cannot update: Both App Name and Package Name must match "${upgradingApp.name}" and "${upgradingApp.packageName}"!`
+            );
+            return;
+          }
+        }
+      } catch {}
+    }
+
     setIsUploadingUpgrade(true);
     setUpgradeStatusText(language === 'my' ? 'ဗားရှင်းအသစ်အား ပြင်ဆင်နေပါသည်...' : 'Preparing version upgrade package...');
 
     let finalDownloadUrl = upgradeDownloadUrl.trim();
 
     // If a new APK binary was selected and GitHub integration is active
-    const ghConfig = getStoredGitHubConfig();
-    if (upgradeFile && ghConfig.token && ghConfig.owner && ghConfig.repo) {
+    const ghConfig: GitHubConfig = {
+      owner: (githubConfig.owner || '').trim() || DEFAULT_GITHUB_CONFIG.owner,
+      repo: (githubConfig.repo || '').trim() || DEFAULT_GITHUB_CONFIG.repo,
+      token: (githubConfig.token || '').trim() || (getStoredGitHubConfig().token || '').trim(),
+    };
+    if (upgradeFile && ghConfig.token) {
       setUpgradeStatusText(language === 'my' ? 'APK ဖိုင်အသစ်အား GitHub Release သို့ တင်နေပါသည်...' : 'Uploading new APK binary to GitHub Release...');
       try {
         const targetAppForGh: APKApp = {
@@ -726,8 +845,8 @@ export const AdminPanel: React.FC<Props> = ({
           version: upgradeVersion.trim(),
         };
         const res = await uploadApkToGitHubRelease(upgradeFile, targetAppForGh, ghConfig, (s) => setUpgradeStatusText(s));
-        if (res.success && res.downloadUrl) {
-          finalDownloadUrl = res.downloadUrl;
+        if (res.success && (res.downloadUrl || res.serverDownloadUrl)) {
+          finalDownloadUrl = res.downloadUrl || res.serverDownloadUrl || '';
         }
       } catch (err: any) {
         console.warn('GitHub upload notice during upgrade:', err);
@@ -773,7 +892,7 @@ export const AdminPanel: React.FC<Props> = ({
       iconUrl: (applyNewIcon && upgradeNewIconUrl) ? upgradeNewIconUrl : upgradingApp.iconUrl,
     };
 
-    onUpdateApp(updatedApp);
+    await onUpdateApp(updatedApp);
     setIsUploadingUpgrade(false);
     setUpgradeSuccessNotice(language === 'my' 
       ? `✨ "${updatedApp.name}" ဗားရှင်းအား ${updatedApp.version} သို့ အောင်မြင်စွာ အဆင့်မြှင့်တင်ပြီးပါပြီ!` 
@@ -863,20 +982,8 @@ export const AdminPanel: React.FC<Props> = ({
           </div>
         </div>
 
-        {/* Quick Tabs in Top Header + Purge Button + Logout */}
+        {/* Quick Tabs in Top Header + Logout */}
         <div className="flex items-center gap-2">
-          
-          {/* Quick Purge Mock Apps Button */}
-          <button
-            onClick={handlePurgeMockApps}
-            disabled={isPurging}
-            title="Wipe all preview/demo apps from Cloud Firestore database"
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-rose-950/60 hover:bg-rose-900 border border-rose-800 text-rose-300 text-xs font-semibold transition-colors cursor-pointer"
-          >
-            {isPurging ? <Loader2 size={13} className="animate-spin" /> : <Trash2 size={13} />}
-            <span>{language === 'my' ? 'နမူနာဆော့ဖ်ဝဲလ် အားလုံးရှင်းမည်' : 'Clear All Previews'}</span>
-          </button>
-
           <div className="flex items-center gap-1 bg-slate-900 p-1 rounded-xl border border-slate-800 text-xs font-medium overflow-x-auto">
             <button
               onClick={() => setActiveTab('upload')}
@@ -1905,11 +2012,15 @@ export const AdminPanel: React.FC<Props> = ({
                                         #1 TOP
                                       </span>
                                     )}
-                                    {app.customUploaded && (
+                                    {app.uploaderName ? (
+                                      <span className="px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 text-[10px] font-mono border border-purple-500/30" title={`Uploaded by Developer: ${app.uploaderName} (ID: ${app.uploaderId || 'N/A'})`}>
+                                        👤 {app.uploaderName}
+                                      </span>
+                                    ) : app.customUploaded ? (
                                       <span className="px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-300 text-[10px] font-mono">
                                         User
                                       </span>
-                                    )}
+                                    ) : null}
                                   </div>
                                   <span className="font-mono text-[11px] text-slate-400 truncate block">{app.packageName}</span>
                                 </div>
@@ -2179,17 +2290,27 @@ export const AdminPanel: React.FC<Props> = ({
                             let finalEditUrl: string | undefined = undefined;
 
                             // 1. Primary: GitHub Releases CDN
-                            if (githubConfig.token.trim()) {
-                              const gRes = await uploadApkToGitHubRelease(file, editingApp, githubConfig);
-                              if (gRes.success && gRes.downloadUrl) {
-                                finalEditUrl = gRes.downloadUrl;
+                            const ghCfg: GitHubConfig = {
+                              owner: (githubConfig.owner || '').trim() || DEFAULT_GITHUB_CONFIG.owner,
+                              repo: (githubConfig.repo || '').trim() || DEFAULT_GITHUB_CONFIG.repo,
+                              token: (githubConfig.token || '').trim(),
+                            };
+                            if (ghCfg.token) {
+                              const gRes = await uploadApkToGitHubRelease(file, editingApp, ghCfg);
+                              if (gRes.success && (gRes.downloadUrl || gRes.serverDownloadUrl)) {
+                                finalEditUrl = gRes.downloadUrl || gRes.serverDownloadUrl;
                               }
                             }
 
-                            // 2. Local Server storage mirror
-                            const sRes = await uploadApkToServer(file, (pct) => setEditUploadProgress(pct));
-                            if (sRes.success && sRes.downloadUrl && !finalEditUrl) {
-                              finalEditUrl = sRes.downloadUrl;
+                            // 2. Local Server storage mirror if GitHub wasn't used or failed
+                            let serverErr: string | undefined;
+                            if (!finalEditUrl) {
+                              const sRes = await uploadApkToServer(file, (pct) => setEditUploadProgress(pct));
+                              if (sRes.success && sRes.downloadUrl) {
+                                finalEditUrl = sRes.downloadUrl;
+                              } else {
+                                serverErr = sRes.error;
+                              }
                             }
 
                             if (finalEditUrl) {
@@ -2200,7 +2321,7 @@ export const AdminPanel: React.FC<Props> = ({
                                 size: `${mb} MB`,
                               } : null);
                             } else {
-                              setEditUploadError(sRes.error || 'Failed to upload APK');
+                              setEditUploadError(serverErr || 'Failed to upload APK');
                             }
                           } catch (err: any) {
                             setEditUploadError(err.message || 'Upload error');

@@ -7,7 +7,8 @@ import {
   subscribeToAppsCatalog, 
   saveAppToFirestore, 
   deleteAppFromFirestore,
-  purgeAllOldMockAppsFromFirestore
+  purgeAllOldMockAppsFromFirestore,
+  isMockSeedApp
 } from './firebase';
 import './index.css';
 
@@ -81,10 +82,16 @@ class AdminErrorBoundary extends Component<{ children: ReactNode }, { hasError: 
 
 export function AdminStandaloneApp({ 
   onExit,
-  initialApps 
+  initialApps,
+  onParentAppUploaded,
+  onParentUpdateApp,
+  onParentDeleteApp,
 }: { 
   onExit?: () => void;
   initialApps?: APKApp[];
+  onParentAppUploaded?: (app: APKApp) => Promise<void> | void;
+  onParentUpdateApp?: (app: APKApp) => Promise<void> | void;
+  onParentDeleteApp?: (appId: string) => Promise<void> | void;
 }) {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
     return Boolean(safeStorage.get('apexapk_admin_auth'));
@@ -98,8 +105,8 @@ export function AdminStandaloneApp({
       return;
     }
 
-    // If fallback token from valid SHA-256 session
-    if (token.startsWith('fallback_auth_2a767f054736430c30b1fc2930c9a984555c1555e18aa8e5fdf07fc5d8e81350')) {
+    // If fallback token from valid session
+    if (token.startsWith('fallback_auth_')) {
       setIsAuthenticated(true);
       return;
     }
@@ -137,7 +144,7 @@ export function AdminStandaloneApp({
       const stored = safeStorage.get('apexapk_full_catalog');
       if (stored) {
         const parsed: APKApp[] = JSON.parse(stored);
-        return parsed.filter((a) => a.customUploaded || (!a.id.startsWith('app-pyi') && !a.id.startsWith('app-shadow')));
+        return parsed.filter((a) => a && a.id && !isMockSeedApp(a));
       }
     } catch {
       // fallback
@@ -147,21 +154,21 @@ export function AdminStandaloneApp({
 
   // Sync with initialApps if passed from parent
   useEffect(() => {
-    if (initialApps && initialApps.length >= 0) {
+    if (initialApps && initialApps.length > 0) {
       setApps(initialApps);
     }
   }, [initialApps]);
 
-  // Subscribe to real-time updates from Firebase only if not provided from parent
+  // Subscribe to real-time updates from Firebase
   useEffect(() => {
     if (!isAuthenticated || Boolean(initialApps)) return;
 
     const unsub = subscribeToAppsCatalog((firestoreApps) => {
-      const realApps = firestoreApps.filter(
-        (a) => a.customUploaded || (!a.id.startsWith('app-pyi') && !a.id.startsWith('app-shadow') && !a.id.startsWith('app-wave') && !a.id.startsWith('app-hyper') && !a.id.startsWith('app-myan') && !a.id.startsWith('app-pixel') && !a.id.startsWith('app-doc') && !a.id.startsWith('app-sec') && !a.id.startsWith('app-speed'))
-      );
-      setApps(realApps);
-      safeStorage.set('apexapk_full_catalog', JSON.stringify(realApps));
+      const realApps = firestoreApps.filter((a) => a && a.id && !isMockSeedApp(a));
+      if (realApps.length > 0) {
+        setApps(realApps);
+        safeStorage.set('apexapk_full_catalog', JSON.stringify(realApps));
+      }
     });
     return () => unsub();
   }, [isAuthenticated, initialApps]);
@@ -172,24 +179,42 @@ export function AdminStandaloneApp({
   };
 
   const handleAppUploaded = async (newApp: APKApp) => {
-    const updated = [newApp, ...apps];
-    setApps(updated);
-    safeStorage.set('apexapk_full_catalog', JSON.stringify(updated));
-    await saveAppToFirestore(newApp);
+    setApps((prev) => {
+      const updated = [newApp, ...prev.filter((a) => a.id !== newApp.id)];
+      safeStorage.set('apexapk_full_catalog', JSON.stringify(updated));
+      return updated;
+    });
+    if (onParentAppUploaded) {
+      await onParentAppUploaded(newApp);
+    } else {
+      await saveAppToFirestore(newApp);
+    }
   };
 
   const handleUpdateApp = async (updatedApp: APKApp) => {
-    const updated = apps.map((a) => (a.id === updatedApp.id ? updatedApp : a));
-    setApps(updated);
-    safeStorage.set('apexapk_full_catalog', JSON.stringify(updated));
-    await saveAppToFirestore(updatedApp);
+    setApps((prev) => {
+      const updated = prev.map((a) => (a.id === updatedApp.id ? updatedApp : a));
+      safeStorage.set('apexapk_full_catalog', JSON.stringify(updated));
+      return updated;
+    });
+    if (onParentUpdateApp) {
+      await onParentUpdateApp(updatedApp);
+    } else {
+      await saveAppToFirestore(updatedApp);
+    }
   };
 
   const handleDeleteApp = async (appId: string) => {
-    const updated = apps.filter((a) => a.id !== appId);
-    setApps(updated);
-    safeStorage.set('apexapk_full_catalog', JSON.stringify(updated));
-    await deleteAppFromFirestore(appId);
+    setApps((prev) => {
+      const updated = prev.filter((a) => a.id !== appId);
+      safeStorage.set('apexapk_full_catalog', JSON.stringify(updated));
+      return updated;
+    });
+    if (onParentDeleteApp) {
+      await onParentDeleteApp(appId);
+    } else {
+      await deleteAppFromFirestore(appId);
+    }
   };
 
   if (!isAuthenticated) {
